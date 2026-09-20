@@ -870,7 +870,6 @@ mod tests {
     #[cfg(test)]
     mod chat_tests {
         use super::*;
-        use crate::protocols::spec::ReasoningEffort;
 
         fn create_valid_chat_request() -> ChatCompletionRequest {
             ChatCompletionRequest {
@@ -910,7 +909,6 @@ mod tests {
                 ebnf: None,
                 stop_token_ids: None,
                 echo: None,
-                reasoning_effort: None,
                 include_reasoning: true,
                 no_stop_trim: false,
                 ignore_eos: false,
@@ -1182,25 +1180,6 @@ mod tests {
 
             // echo = Some(false) should be valid
             request.echo = Some(false);
-            assert!(request.validate().is_ok());
-        }
-
-        #[test]
-        fn test_reasoning_effort_field() {
-            let mut request = create_valid_chat_request();
-
-            // reasoning_effort is None by default, should be valid
-            assert!(request.reasoning_effort.is_none());
-            assert!(request.validate().is_ok());
-
-            // Valid reasoning_effort values: Low, Medium, High
-            request.reasoning_effort = Some(ReasoningEffort::Low);
-            assert!(request.validate().is_ok());
-
-            request.reasoning_effort = Some(ReasoningEffort::Medium);
-            assert!(request.validate().is_ok());
-
-            request.reasoning_effort = Some(ReasoningEffort::High);
             assert!(request.validate().is_ok());
         }
 

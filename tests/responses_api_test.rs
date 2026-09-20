@@ -1,8 +1,9 @@
 // Integration test for Responses API
 
+use serde_json::json;
 use vllm_router_rs::protocols::spec::{
-    GenerationRequest, ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseStatus,
-    ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse, ServiceTier, ToolChoice,
+    GenerationRequest, ResponseInput, ResponseReasoningParam, ResponseStatus, ResponseTool,
+    ResponseToolType, ResponsesRequest, ResponsesResponse, ServiceTier, ToolChoice,
     ToolChoiceValue, Truncation, UsageInfo,
 };
 
@@ -20,7 +21,8 @@ fn test_responses_request_creation() {
         parallel_tool_calls: true,
         previous_response_id: None,
         reasoning: Some(ResponseReasoningParam {
-            effort: Some(ReasoningEffort::Medium),
+            effort: Some(json!("medium")),
+            other: serde_json::Map::new(),
         }),
         service_tier: ServiceTier::Auto,
         store: true,
@@ -147,16 +149,27 @@ fn test_usage_conversion() {
 }
 
 #[test]
-fn test_reasoning_param_default() {
+fn test_reasoning_param_passthrough() {
+    // Arbitrary effort values must roundtrip unchanged
     let param = ResponseReasoningParam {
-        effort: Some(ReasoningEffort::Medium),
+        effort: Some(json!("x-large")),
+        other: serde_json::Map::new(),
     };
 
-    // Test JSON serialization/deserialization preserves default
     let json = serde_json::to_string(&param).unwrap();
     let parsed: ResponseReasoningParam = serde_json::from_str(&json).unwrap();
 
-    assert!(matches!(parsed.effort, Some(ReasoningEffort::Medium)));
+    assert_eq!(parsed.effort, Some(json!("x-large")));
+
+    // No default effort must be injected when absent
+    let parsed: ResponseReasoningParam = serde_json::from_str("{}").unwrap();
+    assert!(parsed.effort.is_none());
+
+    // Unknown fields inside `reasoning` must be preserved
+    let parsed: ResponseReasoningParam =
+        serde_json::from_str(r#"{"effort": "low", "summary": "auto"}"#).unwrap();
+    assert_eq!(parsed.effort, Some(json!("low")));
+    assert_eq!(parsed.other.get("summary"), Some(&json!("auto")));
 }
 
 #[test]
@@ -173,7 +186,8 @@ fn test_json_serialization() {
         parallel_tool_calls: false,
         previous_response_id: None,
         reasoning: Some(ResponseReasoningParam {
-            effort: Some(ReasoningEffort::High),
+            effort: Some(json!("high")),
+            other: serde_json::Map::new(),
         }),
         service_tier: ServiceTier::Priority,
         store: false,

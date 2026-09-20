@@ -517,10 +517,6 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub echo: Option<bool>,
 
-    /// Reasoning effort level for reasoning models (low, medium, high)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<ReasoningEffort>,
-
     /// Whether to include reasoning in the response
     #[serde(default = "default_true")]
     pub include_reasoning: bool,
@@ -844,20 +840,13 @@ pub enum ResponseToolType {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseReasoningParam {
-    #[serde(default = "default_reasoning_effort")]
-    pub effort: Option<ReasoningEffort>,
-}
+    /// Reasoning effort level, passed through to the backend as-is
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<serde_json::Value>,
 
-fn default_reasoning_effort() -> Option<ReasoningEffort> {
-    Some(ReasoningEffort::Medium)
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReasoningEffort {
-    Low,
-    Medium,
-    High,
+    /// Additional fields passed through transparently to the backend
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 // ============= Input/Output Items =============
@@ -3284,6 +3273,45 @@ mod tests {
         let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         assert!(request.model.is_none());
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_chat_completion_reasoning_effort_passthrough() {
+        // Non-enum values must be accepted and preserved verbatim
+        let json = r#"{
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "reasoning_effort": "minimal"
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            request.other.get("reasoning_effort"),
+            Some(&serde_json::json!("minimal"))
+        );
+
+        // The value must survive forwarding (serialize -> deserialize)
+        let serialized = serde_json::to_value(&request).unwrap();
+        assert_eq!(serialized["reasoning_effort"], serde_json::json!("minimal"));
+    }
+
+    #[test]
+    fn test_response_reasoning_effort_passthrough() {
+        // Arbitrary effort values must roundtrip unchanged
+        let json = r#"{"effort": "x-large", "summary": "auto"}"#;
+        let param: ResponseReasoningParam = serde_json::from_str(json).unwrap();
+        assert_eq!(param.effort, Some(serde_json::json!("x-large")));
+        assert_eq!(param.other.get("summary"), Some(&serde_json::json!("auto")));
+
+        let serialized = serde_json::to_value(&param).unwrap();
+        assert_eq!(serialized["effort"], serde_json::json!("x-large"));
+        assert_eq!(serialized["summary"], serde_json::json!("auto"));
+
+        // No default effort must be injected when absent
+        let param: ResponseReasoningParam = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(param.effort.is_none());
+        let serialized = serde_json::to_value(&param).unwrap();
+        assert!(serialized.get("effort").is_none());
     }
 
     #[test]

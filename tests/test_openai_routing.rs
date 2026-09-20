@@ -436,7 +436,8 @@ async fn test_openai_router_chat_with_reasoning_fields() {
     let base_url = mock_server.base_url();
     let router = OpenAIRouter::new(base_url, None).await.unwrap();
 
-    // Create a chat request with all three new reasoning fields
+    // Create a chat request with reasoning fields (echo, reasoning_effort, include_reasoning)
+    // reasoning_effort uses a non-enum value to verify transparent pass-through
     let val = json!({
         "model": "gpt-3.5-turbo",
         "messages": [
@@ -444,7 +445,7 @@ async fn test_openai_router_chat_with_reasoning_fields() {
         ],
         "max_tokens": 100,
         "echo": true,
-        "reasoning_effort": "low",
+        "reasoning_effort": "minimal",
         "include_reasoning": false
     });
     let chat_request: ChatCompletionRequest = serde_json::from_value(val).unwrap();
@@ -452,10 +453,10 @@ async fn test_openai_router_chat_with_reasoning_fields() {
     // Verify the fields are correctly deserialized
     assert_eq!(chat_request.echo, Some(true));
     assert!(!chat_request.include_reasoning);
-    assert!(matches!(
-        chat_request.reasoning_effort,
-        Some(vllm_router_rs::protocols::spec::ReasoningEffort::Low)
-    ));
+    assert_eq!(
+        chat_request.other.get("reasoning_effort"),
+        Some(&json!("minimal"))
+    );
 
     // Route the request to mock server
     let response = router.route_chat(None, &chat_request, None).await;
