@@ -1192,8 +1192,10 @@ impl VllmPDRouter {
     /// Two-stage request processing for vLLM disaggregated mode
     ///
     /// This function handles fine-grained load tracking: the prefill worker's load is only
-    /// incremented during the prefill phase, and the decode worker's load is only incremented
-    /// during the decode phase. This accurately reflects the sequential nature of PD disaggregation.
+    /// incremented during the prefill phase. The decode worker's load is
+    /// reserved at selection time (in PdRouterBase::select_pd_workers) and
+    /// decremented on every exit path below, so in-flight decode demand is
+    /// visible to selection from the moment a request arrives.
     async fn process_vllm_two_stage_request(
         &self,
         original_request: Value,
@@ -1311,7 +1313,10 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
+                // Release the decode reservation (made at selection time)
+                // along with the prefill slot
                 prefill_worker.decrement_load();
+                decode_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1333,7 +1338,9 @@ impl VllmPDRouter {
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
             Err(e) => {
+                // Release the decode reservation (made at selection time)
                 prefill_worker.decrement_load();
+                decode_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1363,7 +1370,9 @@ impl VllmPDRouter {
         let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
             Ok(json) => json,
             Err(e) => {
+                // Release the decode reservation (made at selection time)
                 prefill_worker.decrement_load();
+                decode_worker.decrement_load();
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1389,9 +1398,10 @@ impl VllmPDRouter {
         // Stop profiling on prefill server after its work is done
         self.stop_profiling(&prefill_base_url).await;
 
-        // Prefill phase complete: decrement prefill load, increment decode load
+        // Prefill phase complete: decrement prefill load. The decode slot was
+        // already reserved at selection time (select_pd_workers); the matching
+        // release happens on each exit path below.
         prefill_worker.decrement_load();
-        decode_worker.increment_load();
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
@@ -2021,36 +2031,18 @@ impl RouterTrait for VllmPDRouter {
                     .collect()
             });
 
-            let prefill_policy = self.policy_registry.get_prefill_policy();
-            let decode_policy = self.policy_registry.get_decode_policy();
-
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
+            let (prefill_idx, decode_idx) = match self.pd_router.select_pd_workers(
                 &prefill_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let decode_idx = match decode_policy.select_worker_with_headers(
                 &decode_workers,
                 request_str,
                 request_headers.as_ref(),
             ) {
-                Some(idx) => idx,
+                Some(pair) => pair,
                 None => {
                     RouterMetrics::record_pd_error("server_selection");
                     return (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Decode policy failed to select a worker".to_string(),
+                        "PD policy failed to select workers".to_string(),
                     )
                         .into_response();
                 }
@@ -2064,9 +2056,9 @@ impl RouterTrait for VllmPDRouter {
             info!(
                 "Chat: Selected prefill={} [policy:{}], decode={} [policy:{}]",
                 prefill_worker.url(),
-                prefill_policy.name(),
+                self.policy_registry.get_prefill_policy().name(),
                 decode_worker.url(),
-                decode_policy.name()
+                self.policy_registry.get_decode_policy().name()
             );
 
             // Execute dual dispatch with vLLM two-stage processing
@@ -2192,36 +2184,18 @@ impl RouterTrait for VllmPDRouter {
                     .collect()
             });
 
-            let prefill_policy = self.policy_registry.get_prefill_policy();
-            let decode_policy = self.policy_registry.get_decode_policy();
-
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
+            let (prefill_idx, decode_idx) = match self.pd_router.select_pd_workers(
                 &prefill_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let decode_idx = match decode_policy.select_worker_with_headers(
                 &decode_workers,
                 request_str,
                 request_headers.as_ref(),
             ) {
-                Some(idx) => idx,
+                Some(pair) => pair,
                 None => {
                     RouterMetrics::record_pd_error("server_selection");
                     return (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Decode policy failed to select a worker".to_string(),
+                        "PD policy failed to select workers".to_string(),
                     )
                         .into_response();
                 }
@@ -2235,9 +2209,9 @@ impl RouterTrait for VllmPDRouter {
             info!(
                 "Completion: Selected prefill={} [policy:{}], decode={} [policy:{}]",
                 prefill_worker.url(),
-                prefill_policy.name(),
+                self.policy_registry.get_prefill_policy().name(),
                 decode_worker.url(),
-                decode_policy.name()
+                self.policy_registry.get_decode_policy().name()
             );
 
             // Execute dual dispatch with vLLM two-stage processing
@@ -2414,36 +2388,18 @@ impl RouterTrait for VllmPDRouter {
                     .collect()
             });
 
-            let prefill_policy = self.policy_registry.get_prefill_policy();
-            let decode_policy = self.policy_registry.get_decode_policy();
-
-            let prefill_idx = match prefill_policy.select_worker_with_headers(
+            let (prefill_idx, decode_idx) = match self.pd_router.select_pd_workers(
                 &prefill_workers,
-                request_str,
-                request_headers.as_ref(),
-            ) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-            let decode_idx = match decode_policy.select_worker_with_headers(
                 &decode_workers,
                 request_str,
                 request_headers.as_ref(),
             ) {
-                Some(idx) => idx,
+                Some(pair) => pair,
                 None => {
                     RouterMetrics::record_pd_error("server_selection");
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
-                        "Decode policy failed to select a worker".to_string(),
+                        "PD policy failed to select workers".to_string(),
                     )
                         .into_response();
                 }
@@ -2453,9 +2409,11 @@ impl RouterTrait for VllmPDRouter {
             let decode_worker = &decode_workers[decode_idx];
 
             debug!(
-                "Transparent proxy: prefill={}, decode={}",
+                "Transparent proxy: prefill={} [policy:{}], decode={} [policy:{}]",
                 prefill_worker.url(),
-                decode_worker.url()
+                self.policy_registry.get_prefill_policy().name(),
+                decode_worker.url(),
+                self.policy_registry.get_decode_policy().name()
             );
 
             // Execute two-stage processing

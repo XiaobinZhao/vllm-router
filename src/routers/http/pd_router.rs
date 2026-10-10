@@ -6,7 +6,7 @@ use crate::core::{
     BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig, Worker, WorkerFactory,
     WorkerRegistry, WorkerType,
 };
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{get_healthy_worker_indices, LoadBalancingPolicy, PolicyRegistry};
 use crate::routers::header_utils;
 use axum::{
     body::Body,
@@ -18,6 +18,7 @@ use axum::{
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -34,6 +35,12 @@ pub struct PdRouterBase {
     pub circuit_breaker_config: CircuitBreakerConfig,
     // Intra-node data parallel size for creating DPAwareWorker in add_*_server()
     pub dp_size: usize,
+    // Rotating counter for decode selection tie-breaking among equally
+    // loaded healthy workers. Plain min_by_key breaks ties positionally, so
+    // at equal (zero) load every request selects the first registered decode
+    // worker, pinning low-concurrency traffic onto the first decode pod
+    // (production: 68/68 requests on one pod's ranks while four pods idled).
+    pub decode_rr: Arc<AtomicUsize>,
 }
 
 impl PdRouterBase {
@@ -370,6 +377,115 @@ impl PdRouterBase {
                 cache_aware.init_workers(&model_workers);
             }
         }
+
+        // Sync workers registered at runtime (e.g. K8s service discovery) into
+        // the PD prefill/decode policies used by direct-URL routing. These
+        // policies start with empty worker lists in discovery mode.
+        let pd_policy = match worker_arc.worker_type() {
+            WorkerType::Prefill { .. } => self.policy_registry.get_prefill_policy(),
+            WorkerType::Decode => self.policy_registry.get_decode_policy(),
+            WorkerType::Regular => return,
+        };
+        if let Some(cache_aware) = pd_policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+        {
+            cache_aware.add_worker(worker_arc.as_ref());
+        }
+    }
+
+    /// Select prefill and decode workers for a PD request.
+    ///
+    /// Prefill keeps the prefill policy's full semantics (cache_aware applies
+    /// prefix affinity here, which is the role where KV reuse lives).
+    ///
+    /// Decode must NOT use cache_aware prefix affinity: cache_aware's
+    /// select_worker_with_headers is role-agnostic, so shared-prefix requests
+    /// would all resolve to a single tenant worker regardless of its load,
+    /// collapsing decode onto one engine (observed in production: one decode
+    /// engine saturated while the rest stayed idle, TPOT degraded). vLLM PD
+    /// transfers KV per request, so decode affinity gains nothing. Least-load
+    /// matches the documented decode semantics of
+    /// CacheAwarePolicy::select_worker_pair_with_headers ("Decode: Use
+    /// least-load routing for better load distribution").
+    pub(crate) fn select_pd_workers(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        request_headers: Option<&crate::policies::RequestHeaders>,
+    ) -> Option<(usize, usize)> {
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+
+        let prefill_idx = prefill_policy.select_worker_with_headers(
+            prefill_workers,
+            request_text,
+            request_headers,
+        )?;
+
+        let decode_idx = if decode_policy.name() == "cache_aware" {
+            // Least-load among healthy decoders with a ROTATING tie-break.
+            // Plain min_by_key breaks ties positionally: at equal (zero)
+            // load every request selects the first registered decode worker,
+            // and since reservations are released on completion, sequential
+            // traffic never accumulates enough load to spill past the first
+            // pod's ranks (observed twice in production: all decode traffic
+            // pinned to the first-registered decode pod while the rest
+            // idled). Rotating among the least-loaded candidates keeps
+            // load-awareness while distributing equal-load traffic.
+            let healthy = get_healthy_worker_indices(decode_workers);
+            if healthy.is_empty() {
+                None
+            } else {
+                let min_load = healthy
+                    .iter()
+                    .map(|&idx| decode_workers[idx].load())
+                    .min()?;
+                let candidates: Vec<usize> = healthy
+                    .iter()
+                    .copied()
+                    .filter(|&idx| decode_workers[idx].load() == min_load)
+                    .collect();
+                let pick = self.decode_rr.fetch_add(1, Ordering::Relaxed) % candidates.len();
+                Some(candidates[pick])
+            }
+        } else {
+            decode_policy.select_worker_with_headers(decode_workers, request_text, request_headers)
+        };
+
+        // Reserve the decode slot at selection time. Decode load was
+        // previously only incremented when the decode PHASE began (after the
+        // prefill round trip), leaving the whole prefill window invisible to
+        // selection: every request of a concurrent burst observed zero decode
+        // loads and the min_by_key tie-break pinned 100% of decode traffic
+        // onto the first registered engine (observed twice in production,
+        // rotating with restarts). Reserving here makes the in-flight
+        // commitment visible to subsequent selections immediately.
+        // process_vllm_two_stage_request releases this reservation on every
+        // exit path (prefill-phase failures included).
+        let decode_idx = decode_idx?;
+        decode_workers[decode_idx].increment_load();
+
+        Some((prefill_idx, decode_idx))
+    }
+
+    /// Remove a worker URL from the PD prefill/decode policies' cache-aware trees.
+    /// Prefill workers only exist in the prefill policy's trees and decode workers
+    /// only in the decode policy's; remove_worker_by_url is a no-op for unknown
+    /// tenants, so updating both is safe.
+    fn remove_worker_from_pd_policies(&self, url: &str) {
+        for policy in [
+            self.policy_registry.get_prefill_policy(),
+            self.policy_registry.get_decode_policy(),
+        ] {
+            if let Some(cache_aware) = policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+            {
+                cache_aware.remove_worker_by_url(url);
+            }
+        }
     }
 
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
@@ -404,6 +520,7 @@ impl PdRouterBase {
                     }
                 }
             }
+            self.remove_worker_from_pd_policies(url);
         }
 
         if removed.is_some() {
@@ -447,6 +564,7 @@ impl PdRouterBase {
                     }
                 }
             }
+            self.remove_worker_from_pd_policies(url);
         }
 
         if removed.is_some() {
@@ -481,6 +599,7 @@ impl PdRouterBase {
                             }
                         }
                     }
+                    self.remove_worker_from_pd_policies(w.url());
                     removed_count += 1;
                 }
             }
@@ -705,6 +824,7 @@ impl PdRouterBase {
             client: ctx.client.clone(),
             circuit_breaker_config: core_cb_config,
             dp_size,
+            decode_rr: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1242,6 +1362,7 @@ mod tests {
             client: Client::new(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size: 1,
+            decode_rr: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1260,6 +1381,7 @@ mod tests {
             client: Client::new(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size,
+            decode_rr: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1267,6 +1389,382 @@ mod tests {
         let worker = BasicWorker::new(url, worker_type);
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    fn create_test_pd_router_with_pd_policies(
+        prefill_config: &crate::config::PolicyConfig,
+        decode_config: &crate::config::PolicyConfig,
+    ) -> PdRouterBase {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
+
+        // Mimic RouterFactory::create_vllm_pd_router: install dedicated
+        // prefill/decode policies used by direct-URL routing
+        policy_registry.set_prefill_policy(crate::policies::PolicyFactory::create_from_config(
+            prefill_config,
+        ));
+        policy_registry.set_decode_policy(crate::policies::PolicyFactory::create_from_config(
+            decode_config,
+        ));
+
+        PdRouterBase {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
+            load_monitor_handle: None,
+            client: Client::new(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            dp_size: 1,
+            decode_rr: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn cache_aware_test_config() -> crate::config::PolicyConfig {
+        crate::config::PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 30,
+            max_tree_size: 10000,
+        }
+    }
+
+    fn register_dynamic_worker(router: &PdRouterBase, url: &str, worker_type: WorkerType) {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url.to_string(), worker_type));
+        worker.set_healthy(true);
+        router.register_and_notify(worker);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_worker_add_syncs_pd_policy_trees() {
+        // Regression test for K8s service discovery + cache_aware in PD mode:
+        // VllmPDRouter starts with empty prefill/decode URL lists, so the PD
+        // policies start with empty trees. Workers discovered later must be
+        // synced into those policies, or prefix affinity silently degrades
+        // to random selection.
+        let router = create_test_pd_router_with_pd_policies(
+            &cache_aware_test_config(),
+            &cache_aware_test_config(),
+        );
+
+        // Simulate K8s service discovery registering pods after startup
+        for url in [
+            "http://10.0.0.1:8000",
+            "http://10.0.0.2:8000",
+            "http://10.0.0.3:8000",
+        ] {
+            register_dynamic_worker(
+                &router,
+                url,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            );
+        }
+        for url in [
+            "http://10.0.1.1:8000",
+            "http://10.0.1.2:8000",
+            "http://10.0.1.3:8000",
+        ] {
+            register_dynamic_worker(&router, url, WorkerType::Decode);
+        }
+
+        let prefill_workers = router.worker_registry.get_prefill_workers();
+        let decode_workers = router.worker_registry.get_decode_workers();
+        assert_eq!(prefill_workers.len(), 3);
+        assert_eq!(decode_workers.len(), 3);
+
+        let prefill_policy = router.policy_registry.get_prefill_policy();
+        assert_eq!(prefill_policy.name(), "cache_aware");
+
+        // Identical requests must stick to one prefill worker (prefix affinity)
+        let text = "hello world, this is a repeated prompt prefix for cache affinity";
+        let first = prefill_policy
+            .select_worker_with_headers(&prefill_workers, Some(text), None)
+            .expect("prefill policy must select a worker");
+        for _ in 0..10 {
+            let idx = prefill_policy
+                .select_worker_with_headers(&prefill_workers, Some(text), None)
+                .expect("prefill policy must select a worker");
+            assert_eq!(
+                idx, first,
+                "identical requests scattered across prefill workers: PD policy trees not synced"
+            );
+        }
+
+        // Decode policy must be synced independently
+        let decode_policy = router.policy_registry.get_decode_policy();
+        assert_eq!(decode_policy.name(), "cache_aware");
+        let first = decode_policy
+            .select_worker_with_headers(&decode_workers, Some(text), None)
+            .expect("decode policy must select a worker");
+        for _ in 0..10 {
+            let idx = decode_policy
+                .select_worker_with_headers(&decode_workers, Some(text), None)
+                .expect("decode policy must select a worker");
+            assert_eq!(
+                idx, first,
+                "identical requests scattered across decode workers: PD policy trees not synced"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_worker_remove_syncs_pd_policy_trees() {
+        let router = create_test_pd_router_with_pd_policies(
+            &cache_aware_test_config(),
+            &cache_aware_test_config(),
+        );
+
+        for url in [
+            "http://10.0.0.1:8000",
+            "http://10.0.0.2:8000",
+            "http://10.0.0.3:8000",
+        ] {
+            register_dynamic_worker(
+                &router,
+                url,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            );
+        }
+        for url in ["http://10.0.1.1:8000", "http://10.0.1.2:8000"] {
+            register_dynamic_worker(&router, url, WorkerType::Decode);
+        }
+
+        // Simulate a prefill pod deletion
+        router
+            .remove_prefill_server("http://10.0.0.1:8000")
+            .await
+            .expect("remove_prefill_server failed");
+
+        let prefill_workers = router.worker_registry.get_prefill_workers();
+        assert_eq!(prefill_workers.len(), 2);
+        assert_eq!(router.worker_registry.get_decode_workers().len(), 2);
+
+        // Selection over remaining workers still works and sticks
+        let prefill_policy = router.policy_registry.get_prefill_policy();
+        let text = "another repeated prompt prefix after pod deletion";
+        let first = prefill_policy
+            .select_worker_with_headers(&prefill_workers, Some(text), None)
+            .expect("prefill selection after removal failed");
+        for _ in 0..10 {
+            let idx = prefill_policy
+                .select_worker_with_headers(&prefill_workers, Some(text), None)
+                .expect("prefill selection after removal failed");
+            assert_eq!(
+                idx, first,
+                "affinity broken over remaining prefill workers after removal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_select_pd_workers_prefill_affinity_and_decode_least_load() {
+        // Regression test for decode traffic skew: decode selection must not
+        // use cache_aware prefix affinity. Shared-prefix requests resolving to
+        // a single tenant worker are load-immune and collapse all decode
+        // traffic onto one engine (one decode saturated while the rest stayed
+        // idle in production). Prefill keeps affinity; decode follows load.
+        let router = create_test_pd_router_with_pd_policies(
+            &cache_aware_test_config(),
+            &cache_aware_test_config(),
+        );
+
+        for url in [
+            "http://10.0.0.1:8000",
+            "http://10.0.0.2:8000",
+            "http://10.0.0.3:8000",
+        ] {
+            register_dynamic_worker(
+                &router,
+                url,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            );
+        }
+        for url in [
+            "http://10.0.1.1:8000",
+            "http://10.0.1.2:8000",
+            "http://10.0.1.3:8000",
+        ] {
+            register_dynamic_worker(&router, url, WorkerType::Decode);
+        }
+
+        let prefill_workers = router.worker_registry.get_prefill_workers();
+        let decode_workers = router.worker_registry.get_decode_workers();
+
+        let long_text =
+            "a very long shared prompt prefix repeated across distinct requests ".repeat(20);
+
+        // Prefill affinity must hold: identical/shared-prefix requests stick
+        // to one prefill worker
+        let mut prefill_choices = std::collections::HashSet::new();
+        for _ in 0..5 {
+            let (p, _d) = router
+                .select_pd_workers(&prefill_workers, &decode_workers, Some(&long_text), None)
+                .expect("select_pd_workers failed");
+            prefill_choices.insert(p);
+        }
+        assert_eq!(
+            prefill_choices.len(),
+            1,
+            "prefill affinity broken under select_pd_workers"
+        );
+
+        // Decode must follow load, not prefix affinity: simulate in-flight
+        // load on worker 0 and verify it is avoided
+        decode_workers[0].increment_load();
+
+        let (_p, d) = router
+            .select_pd_workers(&prefill_workers, &decode_workers, Some(&long_text), None)
+            .expect("select_pd_workers failed");
+        assert_ne!(
+            d, 0,
+            "decode selection pinned to loaded worker: decode role misapplied cache affinity"
+        );
+
+        // Steadier check: leave only worker 2 unloaded
+        decode_workers[1].increment_load();
+
+        let (_p, d) = router
+            .select_pd_workers(&prefill_workers, &decode_workers, Some(&long_text), None)
+            .expect("select_pd_workers failed");
+        assert_eq!(
+            d, 2,
+            "decode selection did not prefer the least-loaded worker"
+        );
+
+        // Health gating still applies: worker 2 unhealthy leaves only
+        // loaded-but-healthy workers, which must remain selectable
+        decode_workers[2].set_healthy(false);
+
+        let (_p, d) = router
+            .select_pd_workers(&prefill_workers, &decode_workers, Some(&long_text), None)
+            .expect("select_pd_workers failed");
+        assert!(
+            d == 0 || d == 1,
+            "selection should fall back to loaded-but-healthy workers"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_select_pd_workers_reservation_spreads_concurrent_burst() {
+        // Regression test for decode monopolization under bursts: decode load
+        // was only incremented when the decode PHASE began (after the prefill
+        // round trip), so every request arriving during the prefill window saw
+        // all decode loads at 0 and the min_by_key tie-break deterministically
+        // picked the first decoder. 100% of a concurrent burst collapsed onto
+        // one engine (observed in production twice, worker rotated on
+        // restart). Selection must RESERVE the decode slot by incrementing
+        // load at selection time so subsequent selections observe it.
+        let router = create_test_pd_router_with_pd_policies(
+            &cache_aware_test_config(),
+            &cache_aware_test_config(),
+        );
+
+        for url in [
+            "http://10.0.0.1:8000",
+            "http://10.0.0.2:8000",
+            "http://10.0.0.3:8000",
+        ] {
+            register_dynamic_worker(
+                &router,
+                url,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            );
+        }
+        for url in [
+            "http://10.0.1.1:8000",
+            "http://10.0.1.2:8000",
+            "http://10.0.1.3:8000",
+        ] {
+            register_dynamic_worker(&router, url, WorkerType::Decode);
+        }
+
+        let prefill_workers = router.worker_registry.get_prefill_workers();
+        let decode_workers = router.worker_registry.get_decode_workers();
+
+        // Simulate a burst: consecutive selections happen while previous
+        // requests are still in flight (no completions between them).
+        let mut decode_choices = std::collections::HashSet::new();
+        for i in 0..30 {
+            let text = format!("burst request {} with unique content", i);
+            let (_p, d) = router
+                .select_pd_workers(&prefill_workers, &decode_workers, Some(&text), None)
+                .expect("select_pd_workers failed");
+            decode_choices.insert(d);
+        }
+        assert!(
+            decode_choices.len() >= 2,
+            "consecutive selections collapsed onto a single decode worker \
+             (loads invisible at selection time): {:?}",
+            decode_choices
+        );
+    }
+
+    #[tokio::test]
+    async fn test_select_pd_workers_decode_rotates_on_equal_load() {
+        // Regression test for decode monopolization at low concurrency:
+        // plain min_by_key breaks ties positionally, so at equal (zero) load
+        // every request selects the FIRST registered decode worker, and
+        // since reservations are released on completion, sequential traffic
+        // never accumulates enough load to spill past the first pod's ranks
+        // (production: 68/68 requests pinned to the first decode pod's 8
+        // ranks while 4 pods stayed idle; local repro: 16/16 on one rank).
+        // Equal-load decode selection must rotate across healthy workers.
+        let router = create_test_pd_router_with_pd_policies(
+            &cache_aware_test_config(),
+            &cache_aware_test_config(),
+        );
+
+        for url in [
+            "http://10.0.0.1:8000",
+            "http://10.0.0.2:8000",
+            "http://10.0.0.3:8000",
+        ] {
+            register_dynamic_worker(
+                &router,
+                url,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            );
+        }
+        for url in [
+            "http://10.0.1.1:8000",
+            "http://10.0.1.2:8000",
+            "http://10.0.1.3:8000",
+        ] {
+            register_dynamic_worker(&router, url, WorkerType::Decode);
+        }
+
+        let prefill_workers = router.worker_registry.get_prefill_workers();
+        let decode_workers = router.worker_registry.get_decode_workers();
+
+        // Sequential completed requests: each reservation is released before
+        // the next request arrives, so every selection sees equal loads
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..15 {
+            let text = format!("sequential request {}", i);
+            let (_p, d) = router
+                .select_pd_workers(&prefill_workers, &decode_workers, Some(&text), None)
+                .expect("select_pd_workers failed");
+            seen.insert(d);
+            decode_workers[d].decrement_load();
+        }
+        assert!(
+            seen.len() >= 3,
+            "equal-load decode selection pinned to few workers: {:?}",
+            seen
+        );
     }
 
     // ============= Worker Management Tests =============
