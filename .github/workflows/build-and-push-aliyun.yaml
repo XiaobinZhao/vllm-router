@@ -30,8 +30,8 @@ on:
         type: boolean
 
 env:
-  REGISTRY: crpi-pweus896l7j9p1b9.cn-hangzhou.personal.cr.aliyuncs.com
-  NAMESPACE: images_dev
+  REGISTRY: ${{ secrets.ALIYUN_REGISTRY }}
+  NAMESPACE: ${{ secrets.ALIYUN_NAME_SPACE }}
   IMAGE_NAME: vllm-router
 
 jobs:
@@ -54,8 +54,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.ALIYUN_USERNAME }}
-          password: ${{ secrets.ALIYUN_PASSWORD }}
+          username: ${{ secrets.ALIYUN_REGISTRY_USER }}
+          password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
 
       - name: Determine image tag
         id: meta
